@@ -1,0 +1,513 @@
+#!/usr/bin/perl -T
+
+#
+# Copyright (C) 2019 Red Hat, Inc. All rights reserved.
+#
+# This copyrighted material is made available to anyone wishing to use,
+# modify, copy, or redistribute it subject to the terms and conditions
+# of the GNU General Public License v.2.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+
+# Requires perl-JSON and util-linux version 2.35
+#   util-linux source is available from https://github.com/karelzak/util-linux
+
+use strict;
+no locale;
+
+use Carp;
+use Cwd qw(realpath);
+use Data::Dumper; # For debugging only
+use File::Basename;
+use File::Path qw(make_path remove_tree);
+use File::Spec;
+use File::Temp qw(tempfile tempdir);
+use Getopt::Long qw(:config pass_through);
+use JSON;
+use POSIX qw(strftime);
+use Pod::Usage;
+
+####################
+# We won't use PATH from environment
+delete $ENV{PATH};
+
+# Protect our temporary files and directories
+umask 0077;
+
+# Obtain command line options
+my $debug = 0;
+my $dryrun = 0;
+my $help = 0;
+my $man = 0;
+my $since = "";
+my $until = "";
+my $verbose = 0;
+
+# Format is:
+#   --debug
+#   --dry-run
+#   --verbose
+#   --since='2019-10-30 18:17:16'
+#   --until='2019-10-30 18:17:16'
+
+GetOptions("debug" => \$debug, "dry-run" => \$dryrun, "help|?" => \$help, "man" => \$man, "since=s" => \$since, "until=s" => \$until, "verbose" => \$verbose);
+
+# Default locations of binaries
+my $newlsblk = "/usr/bin/lsblk";
+my $journalctl = "/usr/bin/journalctl";
+
+if ($debug) {
+	# Allow binary path overrides
+	$newlsblk = $1 if $ENV{LSBLK_PATH} =~ /(.+)/;
+	$journalctl = $1 if $ENV{JOURNALCTL_PATH} =~ /(.+)/;
+
+	# Keep temporary files
+	$File::Temp::KEEP_ALL = 1;
+}
+
+pod2usage(0) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+$|=1 if ($verbose || $debug);
+
+####################
+# Arrays of device information
+
+my %devname_by_devno;
+my %holders;
+my %slaves;
+
+####################
+# Enable all available security checks
+File::Temp->safe_level(File::Temp::HIGH);
+
+# Initialise a temporary directory
+my $basedir = tempdir("lsblk_wrap_XXXXXXXX", TMPDIR => 1, CLEANUP => 1);
+
+print "Using temporary directory: $basedir\n" if $verbose;
+
+####################
+# File management subroutines that report what they do when --verbose is used
+
+sub create_path(@)
+{
+	foreach my $path (@_) {
+		next if -d $path;
+		print "  Creating directory $path\n" if $verbose;
+		make_path($path) if !$dryrun;
+	}
+};
+
+sub create_file($$)
+{
+	my $filename = shift;
+	my $contents = shift;
+
+	# FIXME limit filename length
+
+	print "  Creating file $filename\n" if $verbose;
+	return if $dryrun;
+	my ($fd, $tmpfile) = tempfile(basename($filename)."_XXXXXXXX", SUFFIX => ".tmp", DIR => $basedir);
+	rename($tmpfile, $filename) or croak "Failed to rename $tmpfile to $filename";
+	File::Temp::cmpstat($fd, $filename) or croak "$filename got changed externally";
+	print $fd $contents."\n" if defined($contents);
+	close $fd;
+};
+
+sub create_symlink($$)
+{
+	my $dest = shift;
+	my $link = shift;
+
+	my ($realdest) = (realpath($dest) =~ /^(.*)$/);
+
+	if ($dryrun) {
+		print "  Creating symlink from $link to $dest\n" if $verbose;
+		return;
+	}
+
+	my $rellink = File::Spec->abs2rel(($realdest), realpath(dirname($link)));
+
+	if (symlink($rellink, $link)) {
+		print "  Created symlink from $link to $realdest as $rellink\n" if $verbose;
+		return;
+	}
+	if (!$!{EEXIST}) {
+		carp "Failed to create symlink from $link to $realdest as $rellink";
+		return;
+	}
+
+	return if (-l $link && (readlink $link == $rellink));
+
+	# If it already exists, replace it
+	# FIXME Only do this if it changed
+	if (!unlink($link)) {
+		carp "Failed to remove $link for replacement: $!";
+		return;
+	}
+	if (!symlink($rellink, $link)) {
+		carp "Failed to update symlink from $link to $realdest as $rellink";
+		return;
+	}
+	print "  Updated symlink from $link to $realdest as $rellink\n" if $verbose;
+};
+
+sub remove_file($)
+{
+	my $file = shift;
+
+	print "  Removing $file\n" if $verbose;
+	return if $dryrun;
+	unlink $file;
+};
+
+####################
+
+my $sysdir = $basedir."/sys";
+my $devdir = $basedir."/dev";
+
+create_path($devdir, $sysdir."/block", $sysdir."/dev/block");
+
+# FIXME Add mountpoints when we can record them.
+# create_path($basedir."/proc/self");
+# create_file($basedir."/proc/self/mountinfo", undef);
+
+####################
+
+# Read journal entries:  
+
+# journalctl -t UDEVLOG -b --output json SUBSYSTEM=block
+
+my @newargs = ("journalctl", "-t", "UDEVLOG", "-b", "--output", "json", "SUBSYSTEM=block");
+
+push @newargs, "--since=$1" if ($since =~ /(.+)/);
+push @newargs, "--until=$1" if ($until =~ /(.+)/);
+
+####################
+
+print "Running: ".join(" ", @newargs)."\n" if $verbose;
+die "fork failed: $!" unless defined(my $pid = open(LOG, "-|"));
+if (!$pid) {           # child process
+	# To test against a pre-generated journal file replace with:
+	# system "cat /PATH/log_example.json";
+	#system "cat /data2/agk/git/storage_logger/storage-logger/rhel8_log_example.json";
+	(system { $journalctl } @newargs) == 0 or croak "Failed to run $journalctl";
+	exit 1;
+}
+
+while (<LOG>) {
+	my $logentry = decode_json $_;
+
+	print "Processing line $. (".strftime("%Y/%m/%d %T.", localtime $logentry->{_SOURCE_REALTIME_TIMESTAMP} / 1000000). ($logentry->{_SOURCE_REALTIME_TIMESTAMP} % 1000000).") - $logentry->{ACTION} $logentry->{DEVNAME}\n" if $verbose;
+
+	my $majmin = $logentry->{MAJOR}.":".$logentry->{MINOR};
+	if ($majmin =~ /^(\d+:\d+)$/) {
+		$majmin = $1;
+	} else {
+		carp "Ignoring log entry: Invalid MAJOR:MINOR $majmin";
+		next;
+	}
+
+	my $devname;
+	if ($logentry->{DEVNAME} =~ /^(\/dev\/[-a-zA-Z0-9#+:=\@_][-a-zA-Z0-9#+.:=\@_]*)$/) {
+		$devname = $1;
+	} else {
+		carp "Ignoring log entry: Invalid DEVNAME $devname for $majmin";
+		next;
+	}
+
+	my $devpath;
+	# Limit to character set supported by udev
+	if ($logentry->{DEVPATH} !~ /(\.\.|\/\.\.|\.\.\/)/ && $logentry->{DEVPATH} =~ /^([-a-zA-Z0-9#+.:=\@_\/\\]*)$/) {
+		$devpath = $1;
+	} else {
+		carp "Ignoring log entry: Invalid DEVPATH value $logentry->{DEVPATH} for $majmin";
+		next;
+	}
+
+	if ($logentry->{ACTION} eq "change" || $logentry->{ACTION} eq "add") {
+		create_file("${basedir}${devname}",
+			"MAJOR=$logentry->{MAJOR}\n".
+			"MINOR=$logentry->{MINOR}\n".
+			"OWNER=$logentry->{UDEVLOG_LSBLK_OWNER}\n".
+			"GROUP=$logentry->{UDEVLOG_LSBLK_GROUP}\n".
+			"MODE=$logentry->{UDEVLOG_LSBLK_MODE}\n".
+			"ID_FS_LABEL_ENC=$logentry->{ID_FS_LABEL_ENC}\n".
+			"ID_FS_UUID_ENC=$logentry->{ID_FS_UUID_ENC}\n".
+			"ID_PART_ENTRY_NAME=$logentry->{ID_PART_ENTRY_NAME}\n".
+			"ID_PART_TABLE_UUID=$logentry->{ID_PART_TABLE_UUID}\n".
+			"ID_PART_TABLE_TYPE=$logentry->{ID_PART_TABLE_TYPE}\n".
+			"ID_FS_TYPE=$logentry->{ID_FS_TYPE}\n".
+			"ID_PART_ENTRY_TYPE=$logentry->{ID_PART_ENTRY_TYPE}\n".
+			"ID_PART_ENTRY_UUID=$logentry->{ID_PART_ENTRY_UUID}\n".
+			"ID_PART_ENTRY_FLAGS=$logentry->{ID_PART_ENTRY_FLAGS}\n".
+			"ID_MODEL=$logentry->{ID_MODEL}\n".
+			"ID_WWN_WITH_EXTENSION=$logentry->{ID_WWN_WITH_EXTENSION}\n".
+			"ID_WWN=$logentry->{ID_WWN}\n".
+			"ID_SCSI_SERIAL=$logentry->{ID_SCSI_SERIAL}\n".
+			"ID_SERIAL_SHORT=$logentry->{ID_SERIAL_SHORT}");
+
+		foreach my $devlink (split (/ /, $logentry->{DEVLINKS})) {
+			if ($devlink !~ /(\.\.|\/\.\.|\.\.\/)/ && $devlink =~ /^([-a-zA-Z0-9#+.:=\@_\/\\]+)$/) {
+				$devlink = $1;
+			} else {
+				carp "Skipping invalid DEVLINKS value $devlink";
+				next;
+			}
+
+			create_path($basedir.dirname($devlink));
+			create_symlink($basedir.$devname, $basedir.$devlink);
+		};
+
+		my $sysdevdir = $sysdir.$devpath;
+		create_path($sysdevdir."/holders");
+
+		if ($logentry->{DEVTYPE} eq "disk") {
+			create_symlink($sysdir.$devpath, $sysdir."/block/".basename($devname));
+
+			create_path($sysdevdir."/slaves", $sysdevdir."/queue", $sysdevdir."/device");
+
+			create_file("$sysdevdir/device/model", $logentry->{UDEVLOG_LSBLK_MODEL});
+			create_file("$sysdevdir/device/state", $logentry->{UDEVLOG_LSBLK_STATE});
+
+			if (defined $logentry->{UDEVLOG_DEVICE_TYPE}) {
+				create_file("$sysdevdir/device/type", $logentry->{UDEVLOG_DEVICE_TYPE});
+			};
+
+			if (defined $logentry->{UDEVLOG_DEVICE_REV}) {
+				create_file("$sysdevdir/device/rev", $logentry->{UDEVLOG_DEVICE_REV});
+			};
+
+			if (defined $logentry->{UDEVLOG_DEVICE_VENDOR}) {
+				create_file("$sysdevdir/device/vendor", $logentry->{UDEVLOG_DEVICE_VENDOR});
+			};
+
+			if (defined $logentry->{UDEVLOG_DEVICE_SERIAL}) {
+				create_file("$sysdevdir/device/serial", $logentry->{UDEVLOG_DEVICE_SERIAL});
+			};
+		};
+
+		create_symlink($sysdir.$devpath, $sysdir."/dev/block/".$majmin);
+
+		create_file("$sysdevdir/dev", $majmin);
+		create_file("$sysdevdir/ro", $logentry->{UDEVLOG_BLOCK_RO});
+		create_file("$sysdevdir/alignment_offset", $logentry->{UDEVLOG_BLOCK_ALIGNMENT_OFFSET});
+		create_file("$sysdevdir/discard_alignment", $logentry->{UDEVLOG_BLOCK_DISCARD_ALIGNMENT});
+		create_file("$sysdevdir/ext_range", $logentry->{UDEVLOG_BLOCK_EXT_RANGE});
+		create_file("$sysdevdir/capability", $logentry->{UDEVLOG_BLOCK_CAPABILITY});
+		create_file("$sysdevdir/size", $logentry->{UDEVLOG_BLOCK_SIZE});
+		create_file("$sysdevdir/removable", $logentry->{UDEVLOG_BLOCK_REMOVABLE});
+
+		# Device-mapper entries
+		if ($devname =~ /^\/dev\/dm-/) {
+			create_path($sysdevdir."/dm");
+			create_file("$sysdevdir/dm/name", $logentry->{DM_NAME});
+			create_file("$sysdevdir/dm/uuid", $logentry->{DM_UUID});
+			create_file("$sysdevdir/dm/suspended", $logentry->{DM_SUSPENDED});
+		};
+
+		if ($logentry->{DEVTYPE} eq "disk") {
+			create_file("$sysdevdir/queue/discard_max_bytes", $logentry->{UDEVLOG_QUEUE_DISCARD_MAX_BYTES});
+			create_file("$sysdevdir/queue/scheduler", $logentry->{UDEVLOG_QUEUE_SCHEDULER});
+			create_file("$sysdevdir/queue/nr_requests", $logentry->{UDEVLOG_QUEUE_NR_REQUESTS});
+			create_file("$sysdevdir/queue/minimum_io_size", $logentry->{UDEVLOG_QUEUE_MINIMUM_IO_SIZE});
+			create_file("$sysdevdir/queue/discard_zeroes_data", $logentry->{UDEVLOG_QUEUE_DISCARD_ZEROES_DATA});
+			create_file("$sysdevdir/queue/rotational", $logentry->{UDEVLOG_QUEUE_ROTATIONAL});
+			create_file("$sysdevdir/queue/read_ahead_kb", $logentry->{UDEVLOG_QUEUE_READ_AHEAD_KB});
+			create_file("$sysdevdir/queue/physical_block_size", $logentry->{UDEVLOG_QUEUE_PHYSICAL_BLOCK_SIZE});
+			create_file("$sysdevdir/queue/optimal_io_size", $logentry->{UDEVLOG_QUEUE_OPTIMAL_IO_SIZE});
+			create_file("$sysdevdir/queue/logical_block_size", $logentry->{UDEVLOG_QUEUE_LOGICAL_BLOCK_SIZE});
+			create_file("$sysdevdir/queue/discard_granularity", $logentry->{UDEVLOG_QUEUE_DISCARD_GRANULARITY});
+		}
+
+		if (defined $logentry->{UDEVLOG_QUEUE_ADD_RANDOM}) {
+			create_file("$sysdevdir/queue/add_random", $logentry->{UDEVLOG_QUEUE_ADD_RANDOM});
+		};
+
+		if (defined $logentry->{UDEVLOG_QUEUE_WRITE_SAME_MAX_BYTES}) {
+			create_file("$sysdevdir/queue/write_same_max_bytes", $logentry->{UDEVLOG_QUEUE_WRITE_SAME_MAX_BYTES});
+		};
+
+		if (defined $logentry->{UDEVLOG_QUEUE_ZONED}) {
+			create_file("$sysdevdir/queue/zoned", $logentry->{UDEVLOG_QUEUE_ZONED});
+		};
+
+		if (defined $logentry->{MD_LEVEL}) {
+			create_path($sysdevdir."/md");
+			create_file("$sysdevdir/md/level", $logentry->{MD_LEVEL});
+		};
+
+		# Store holders and slaves for the end
+		($devname_by_devno{$majmin}) = $devname =~ /\/dev\/(.*)/;
+		$holders{$majmin} = $logentry->{UDEVLOG_BLOCK_HOLDERS};
+		$slaves{$majmin} = $logentry->{UDEVLOG_BLOCK_SLAVES};
+
+	} elsif ($logentry->{ACTION} eq "remove") {
+		# Remove this item.  What about dependencies - can we trust the ordering?
+		remove_file "${basedir}${devname}";
+
+		foreach my $devlink (split (/ /, $logentry->{DEVLINKS})) {
+			if ($devlink !~ /(\.\.|\/\.\.|\.\.\/)/ && $devlink =~ /^([-a-zA-Z0-9#+.:=\@_\/\\]+)$/) {
+				$devlink = $1;
+			} else {
+				carp "Not trying to remove invalid DEVLINKS value $devlink for $devname ($majmin)";
+				next;
+			}
+
+			remove_file $basedir.$devlink;
+		};
+
+		remove_file $sysdir."/block/".basename($devname);
+		remove_file $sysdir."/dev/block/".$majmin;
+
+		print "  Removing directory $sysdir$devpath\n" if $verbose;
+		remove_tree($sysdir.$devpath) if !$dryrun;
+
+		# Remove stored holders and slaves
+		delete $devname_by_devno{$majmin};
+		delete $holders{$majmin};
+		delete $slaves{$majmin};
+	};
+}
+
+close LOG;
+
+####################
+print "Processing all device holders\n" if $verbose;
+
+# Create holders/slaves symlinks
+foreach my $majmin (keys %holders) {
+	foreach my $holder_majmin (split / /, $holders{$majmin}) {
+		if ($holder_majmin =~ /^(\d+:\d+)$/) {
+			$holder_majmin = $1;
+		} else {
+			carp "Ignoring invalid holder MAJOR:MINOR $holder_majmin for $majmin";
+			next;
+		}
+		create_symlink($sysdir."/dev/block/$holder_majmin", $sysdir."/dev/block/".$majmin."/holders/".$devname_by_devno{$holder_majmin});
+		create_symlink($sysdir."/dev/block/".$majmin, $sysdir."/dev/block/".$holder_majmin."/slaves/".$devname_by_devno{$majmin});
+	}
+};
+
+print "Processing all device slaves\n" if $verbose;
+
+foreach my $majmin (keys %slaves) {
+	foreach my $slave_majmin (split / /, $slaves{$majmin}) {
+		if ($slave_majmin =~ /^(\d+:\d+)$/) {
+			$slave_majmin = $1;
+		} else {
+			carp "Ignoring invalid slave MAJOR:MINOR $slave_majmin for $majmin";
+			next;
+		}
+		create_symlink($sysdir."/dev/block/".$slave_majmin, $sysdir."/dev/block/".$majmin."/slaves/".$devname_by_devno{$slave_majmin});
+		create_symlink($sysdir."/dev/block/".$majmin, $sysdir."/dev/block/".$slave_majmin."/holders/".$devname_by_devno{$majmin});
+	}
+};
+
+####################
+# Finally run 'lsblk' using the specially-prepared context
+
+my @newargs = (basename($newlsblk), "--sysroot=".$basedir);
+
+foreach my $arg (@ARGV) {
+	push @newargs, $arg =~ /^(.*)$/;
+}
+
+print "Running: ".join(" ", @newargs)."\n" if $verbose;
+if (!$dryrun) {
+	(system { $newlsblk } @newargs) == 0 or croak "Failed to run $newlsblk";
+}
+
+exit 0;
+
+__END__
+
+=head1 NAME
+
+lsblkj - Report logged historic data using lsblk
+
+=head1 SYNOPSIS
+
+lsblkj [options] [lsblk options] [device...]
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--debug>
+
+Allow the environment variables LSBLK_PATH and JOURNALCTL_PATH to
+override the hard-coded locations of the external lsblk and journalctl
+binaries.  Do not delete the temporary directories and files when the
+script exits.
+
+=item B<--dry-run>
+
+Do not create the temporary files and directories the script requires
+and do not call lsblk.
+Useful with --verbose to check the effect of your input data.
+
+=item B<--help>
+
+Print a brief help message and exit.
+
+=item B<--man>
+
+Print the manual page and exit.
+
+=item B<--since=>
+
+Timestamp of the first journal record to use when reconstructing the system's
+device configuration.  This will normally be a time when the machine was booted.
+The basic time format is "YYYY-MM-DD HH:II:SS" but for more details refer
+to the man pages for journalctl(1) and systemd.time(7).
+
+=item B<--until=>
+
+Timestamp of the last journal record to use when reconstructing the system's
+device configuration.  Storage logging should have been running continuously
+and the system should not have been rebooted between the time specified
+with the --since argument and this time. 
+The basic time format is "YYYY-MM-DD HH:II:SS" but for more details refer
+to the man pages for journalctl(1) and systemd.time(7).
+
+=item B<--verbose>
+
+Report the actions of the wrapper.
+
+=back
+
+=head1 DESCRIPTION
+
+B<lsblkj> reproduces the system's storage block device configuration at
+a specified earlier time then uses lsblk to show you the result.  
+You may use any of lsblk's options, but filesystem and mount point
+information will rarely be accurate because the data is only sampled
+when there is a change to the underlying block device.
+
+The raw data can also be accessed directly using journalctl(1).
+For example, to find the major and minor number of the LVM Logical
+Volume vg1/lvol0 across multiple reboot cycles you could use:
+
+journalctl -t UDEVLOG --output verbose --output-fields=PERSISTENT_STORAGE_ID,MAJOR,MINOR PERSISTENT_STORAGE_ID=dm-name-vg1-lvol0
+
+Additional fields that lsblk does not show, such as device-mapper
+tables (UDEVLOG_DM_TABLE_LIVE), can be retrieved using this method.
+
+=head1 SEE ALSO
+
+journalctl(1), 
+systemd.time(7),
+lsblk(8)
+
+=head1 AUTHOR
+
+Alasdair G. Kergon <agk@redhat.com>
+
+Please send bug reports and suggestions to the linux-lvm mailing list linux-lvm@redhat.com 
+https://www.redhat.com/mailman/listinfo/linux-lvm 
+or use the web interface at https://github.com/lvmteam/storage-logger
+
+=cut

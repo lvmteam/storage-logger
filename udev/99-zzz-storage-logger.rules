@@ -1,0 +1,12 @@
+# Copyright (C) 2019 Red Hat, Inc. All rights reserved.
+
+# This rule must run after all rules able to change any block device state
+# so that the environment variables hold a correct and complete record.
+
+# Only perform this for block devices.
+SUBSYSTEM!="block", GOTO="skip_udev_storage_logger"
+
+# Run script to log udev environment variables into the system journal.
+TEST{755}=="/sbin/udev_storage_logger.sh", RUN+="/sbin/udev_storage_logger.sh"
+
+LABEL="skip_udev_storage_logger"

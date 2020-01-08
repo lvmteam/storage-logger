@@ -1,0 +1,74 @@
+Storage-logger
+==============
+The storage-logger project maintains a record of the storage
+configuration of a linux system as it changes over time.
+The idea is to provide a quick way to check the state
+of a system at times in the past.
+
+Logging
+=======
+The initial logging implementation is triggered by storage uevents and
+consists of two components:
+
+1. A new udev rule file, 99-zzz-storage-logger.rules, which runs after
+all the other rules have run and invokes:
+
+2. A script, udev_storage_logger.sh, that captures relevant
+information about devices that changed and stores it in the system
+journal.
+
+The effect is to log relevant uevents plus some supplementary
+information.  It does not yet handle filesystem-related events.
+
+Reporting
+=========
+Two methods to query the data are offered:
+
+1. journalctl
+Reports the raw data using simple filtering.
+Data is tagged with the identifier UDEVLOG and retrievable as
+key-value pairs.
+All the captured data:
+  journalctl -t UDEVLOG --output verbose
+or as JSON:
+  journalctl -t UDEVLOG --output json
+Between a time range:
+  --since 'YYYY-MM-DD HH:MM:SS' 
+  --until 'YYYY-MM-DD HH:MM:SS'
+Other filtering features are described in the man page.
+
+2. lsblkj
+This wrapper creates a dummy system environment that "looks like" the
+system did at a specified earlier time and then runs lsblk against it.
+It accepts --since and --until arguments to pass to journalctl to
+select the desired data, and passes other arguments controlling
+the output format to the real lsblk.  
+Use --verbose to watch it setting up the temporary environment .
+Use --dry-run to see what it would do without actually doing it.
+ 
+Key Dependencies
+================
+The logging script requires bash, udev and a systemd journal.
+The lsblk wrapper is currently written in perl and requires util-linux
+version 2.35 or above and the perl JSON module.
+
+Installation
+============
+Fedora rawhide packages are available.
+
+Tell the udev daemon to refresh its rules and start logging with
+  udevadm control -R
+
+On Fedora, the files get installed into:
+  /usr/lib/udev/rules.d/99-zzz-storage-logger.rules
+  /usr/sbin/udev_storage_logger.sh
+  /usr/bin/lsblkj
+  /usr/share/man/man1/lsblkj.1.gz
+
+Feedback
+========
+Is this useful and should we develop it further?
+Please let us know using the linux-lvm mailing list.
+  https://www.redhat.com/mailman/listinfo/linux-lvm
+  linux-lvm@redhat.com
+
