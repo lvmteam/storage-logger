@@ -1,5 +1,5 @@
 Name:		storage-logger
-Version:	0.5
+Version:	0.5.1
 Release:	0%{?dist}
 Summary:	Records the storage configuration in the system journal
 URL:		https://github.com/lvmteam/storage-logger
@@ -66,5 +66,8 @@ the system journal by the storage-logger package.
 %{_mandir}/man1/lsblkj.1*
 
 %changelog
+* Fri Feb 7 2020 Alasdair Kergon <agk@redhat.com> 0.5.1-0
+- Add --file to lsblkj to use journalctl JSON extracts.
+
 * Wed Jan 8 2020 Alasdair Kergon <agk@redhat.com> 0.5-0
 - Initial release

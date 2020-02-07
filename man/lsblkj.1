@@ -124,7 +124,7 @@
 .\" ========================================================================
 .\"
 .IX Title "lsblkj 1"
-.TH lsblkj 1 "2020-01-08" "system-logger 0.5.0" "System Administration"
+.TH lsblkj 1 "2020-02-07" "system-logger 0.5.1" "System Administration"
 .\" For nroff, turn off justification.  Always turn off hyphenation; it makes
 .\" way too many mistakes in technical documents.
 .if n .ad l
@@ -147,6 +147,10 @@ script exits.
 Do not create the temporary files and directories the script requires
 and do not call lsblk.
 Useful with \-\-verbose to check the effect of your input data.
+.IP "\fB\-\-file=\fR" 8
+.IX Item "--file="
+Read pre-filtered input from the named file instead of invoking journalctl 
+directly.  Use \- to read from \s-1STDIN\s0.
 .IP "\fB\-\-help\fR" 8
 .IX Item "--help"
 Print a brief help message and exit.
