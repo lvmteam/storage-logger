@@ -39,6 +39,7 @@ umask 0077;
 # Obtain command line options
 my $debug = 0;
 my $dryrun = 0;
+my $file = "";
 my $help = 0;
 my $man = 0;
 my $since = "";
@@ -48,20 +49,23 @@ my $verbose = 0;
 # Format is:
 #   --debug
 #   --dry-run
+#   --file=filename.json
 #   --verbose
 #   --since='2019-10-30 18:17:16'
 #   --until='2019-10-30 18:17:16'
 
-GetOptions("debug" => \$debug, "dry-run" => \$dryrun, "help|?" => \$help, "man" => \$man, "since=s" => \$since, "until=s" => \$until, "verbose" => \$verbose);
+GetOptions("debug" => \$debug, "dry-run" => \$dryrun, "file=s" => \$file, "help|?" => \$help, "man" => \$man, "since=s" => \$since, "until=s" => \$until, "verbose" => \$verbose);
 
 # Default locations of binaries
 my $newlsblk = "/usr/bin/lsblk";
 my $journalctl = "/usr/bin/journalctl";
+my $systemd_analyze = "/usr/bin/systemd-analyze";
 
 if ($debug) {
 	# Allow binary path overrides
 	$newlsblk = $1 if $ENV{LSBLK_PATH} =~ /(.+)/;
 	$journalctl = $1 if $ENV{JOURNALCTL_PATH} =~ /(.+)/;
+	$systemd_analyze = $1 if $ENV{SYSTEMD_ANALYZE_PATH} =~ /(.+)/;
 
 	# Keep temporary files
 	$File::Temp::KEEP_ALL = 1;
@@ -165,6 +169,36 @@ sub remove_file($)
 
 ####################
 
+# Use external systemd-analyze to process --since and --until time specifications
+sub convert_timestamp($)
+{
+	my $timespec = shift;
+	my $timestamp = 0;
+
+	my @newargs = ("systemd-analyze", "timestamp");
+	push @newargs, "$1" if ($timespec =~ /(.+)/);
+
+	print "Running: ".join(" ", @newargs)."\n" if $verbose;
+	die "fork failed: $!" unless defined(my $pid = open(TIMESTAMP, "-|"));
+	if (!$pid) {           # child process
+		(system { $systemd_analyze } @newargs) == 0 or croak "Failed to run $systemd_analyze";
+		exit 1;
+	}
+
+	# External format is:
+	#   UNIX seconds: @1581106829.870249    
+	# Internally we use the journal format that drops the decimal point.
+	while (<TIMESTAMP>) {
+		$timestamp = $1.$2."0" x (6-length($2)) if /UNIX seconds: @([0-9]+)?(?:\.([0-9]+))*/;
+	}
+
+	close TIMESTAMP;
+
+	$timestamp;
+};
+
+####################
+
 my $sysdir = $basedir."/sys";
 my $devdir = $basedir."/dev";
 
@@ -178,27 +212,81 @@ create_path($devdir, $sysdir."/block", $sysdir."/dev/block");
 
 # Read journal entries:  
 
-# journalctl -t UDEVLOG -b --output json SUBSYSTEM=block
-
-my @newargs = ("journalctl", "-t", "UDEVLOG", "-b", "--output", "json", "SUBSYSTEM=block");
-
-push @newargs, "--since=$1" if ($since =~ /(.+)/);
-push @newargs, "--until=$1" if ($until =~ /(.+)/);
-
 ####################
 
-print "Running: ".join(" ", @newargs)."\n" if $verbose;
-die "fork failed: $!" unless defined(my $pid = open(LOG, "-|"));
-if (!$pid) {           # child process
-	# To test against a pre-generated journal file replace with:
-	# system "cat /PATH/log_example.json";
-	#system "cat /data2/agk/git/storage_logger/storage-logger/rhel8_log_example.json";
-	(system { $journalctl } @newargs) == 0 or croak "Failed to run $journalctl";
-	exit 1;
+# Set up LOG as STDIN or $file or output from journalctl.
+if ($file eq "-") {
+	print "Reading JSON from standard input.\n" if $verbose;
+	*LOG = *STDIN;
+} elsif ($file ne "") {
+	print "Reading JSON from $file.\n" if $verbose;
+	open(LOG, '<', $file) or die "Open $file failed: $!";
+} else {
+	# journalctl -t UDEVLOG -b --output json SUBSYSTEM=block
+
+	my @newargs = ("journalctl", "-t", "UDEVLOG", "-b", "--output", "json", "SUBSYSTEM=block");
+
+	# Pass arguments --since and --until to external journalctl command
+	push @newargs, "--since=$1" if ($since =~ /(.+)/);
+	push @newargs, "--until=$1" if ($until =~ /(.+)/);
+
+	print "Running: ".join(" ", @newargs)."\n" if $verbose;
+	die "fork failed: $!" unless defined(my $pid = open(LOG, "-|"));
+	if (!$pid) {           # child process
+		(system { $journalctl } @newargs) == 0 or croak "Failed to run $journalctl";
+		exit 1;
+	}
+}
+
+# Process all input lines by default
+my $process_line = 1;
+
+# If we're processing a file or standard input, we must filter with --since and --until internally.
+my $since_timestamp = 0;
+my $until_timestamp = 0;
+
+if ($file ne "") {
+	if ($since ne "") {
+		# Don't process lines until we reach $since
+		$process_line = 0;
+
+		$since_timestamp = convert_timestamp($since);
+		
+		print "Processing records from realtime $since_timestamp.\n" if $verbose;
+	}
+	if ($until ne "") {
+		$until_timestamp = convert_timestamp($until);
+
+		print "Processing records until realtime $until_timestamp.\n" if $verbose;
+	}
 }
 
 while (<LOG>) {
 	my $logentry = decode_json $_;
+
+	if ($logentry->{SYSLOG_IDENTIFIER} ne "UDEVLOG") {
+		print "Ignoring line $. - Not a udev message.\n" if $verbose;
+		next;
+	};
+	if ($logentry->{SUBSYSTEM} ne "block") {
+		print "Ignoring line $. - Not a udev block device message.\n" if $verbose;
+		next;
+	};
+
+	if (!$process_line && $since_timestamp > 0 && $logentry->{_SOURCE_REALTIME_TIMESTAMP} >= $since_timestamp) {
+		print "Reached timestamp $since_timestamp - Starting processing.\n" if $verbose;
+		$process_line = 1;
+	}
+
+	if ($process_line && $until_timestamp > 0 && $logentry->{_SOURCE_REALTIME_TIMESTAMP} > $until_timestamp) {
+		print "Reached timestamp $until_timestamp - Stopping processing.\n" if $verbose;
+		$process_line = 0;
+	}
+
+	if (!$process_line) {
+		print "Ignoring line $. - Timestamp $logentry->{_SOURCE_REALTIME_TIMESTAMP} outside range.\n" if $verbose;
+		next;
+	}
 
 	print "Processing line $. (".strftime("%Y/%m/%d %T.", localtime $logentry->{_SOURCE_REALTIME_TIMESTAMP} / 1000000). ($logentry->{_SOURCE_REALTIME_TIMESTAMP} % 1000000).") - $logentry->{ACTION} $logentry->{DEVNAME}\n" if $verbose;
 
@@ -448,6 +536,11 @@ script exits.
 Do not create the temporary files and directories the script requires
 and do not call lsblk.
 Useful with --verbose to check the effect of your input data.
+
+=item B<--file=>
+
+Read pre-filtered input from the named file instead of invoking journalctl 
+directly.  Use - to read from STDIN.
 
 =item B<--help>
 
