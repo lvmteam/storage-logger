@@ -1,5 +1,5 @@
 Name:		storage-logger
-Version:	0.5.1
+Version:	0.5.2
 Release:	0%{?dist}
 Summary:	Records the storage configuration in the system journal
 URL:		https://github.com/lvmteam/storage-logger
@@ -52,6 +52,9 @@ Requires: %{name} = %{version}-%{release}
 Requires: systemd-udev >= 244
 Requires: util-linux >= 2.35
 Requires: perl-JSON
+%if 0%{?fedora} >= 33
+Requires: perl-locale
+%endif
 
 %description report
 storage-logger-report provides lsblkj as a wrapper around lsblk to
@@ -66,6 +69,9 @@ the system journal by the storage-logger package.
 %{_mandir}/man1/lsblkj.1*
 
 %changelog
+* Tue Mar 10 2020 Alasdair Kergon <agk@redhat.com> 0.5.2-0
+- perl-locale is a separate sub-package in Fedora 33.
+
 * Fri Feb 7 2020 Alasdair Kergon <agk@redhat.com> 0.5.1-0
 - Add --file to lsblkj to use journalctl JSON extracts.
 
