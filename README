@@ -45,6 +45,7 @@ select the desired data, and passes other arguments controlling
 the output format to the real lsblk.  
 Use --verbose to watch it setting up the temporary environment .
 Use --dry-run to see what it would do without actually doing it.
+Use --git to create a git repository recording the changes over time.
  
 Key Dependencies
 ================

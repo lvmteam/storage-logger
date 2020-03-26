@@ -69,7 +69,8 @@ the system journal by the storage-logger package.
 %{_mandir}/man1/lsblkj.1*
 
 %changelog
-* Tue Mar 10 2020 Alasdair Kergon <agk@redhat.com> 0.5.2-0
+* Thu Mar 26 2020 Alasdair Kergon <agk@redhat.com> 0.5.2-0
+- Add --git to lsblkj to create a git repository of the changes.
 - perl-locale is a separate sub-package in Fedora 33.
 
 * Fri Feb 7 2020 Alasdair Kergon <agk@redhat.com> 0.5.1-0

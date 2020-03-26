@@ -1,7 +1,7 @@
 #!/usr/bin/perl -T
 
 #
-# Copyright (C) 2019 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2019-2020 Red Hat, Inc. All rights reserved.
 #
 # This copyrighted material is made available to anyone wishing to use,
 # modify, copy, or redistribute it subject to the terms and conditions
@@ -14,6 +14,7 @@
 # Requires perl-JSON and util-linux version 2.35
 #   util-linux source is available from https://github.com/karelzak/util-linux
 
+###############################
 use strict;
 no locale;
 
@@ -26,8 +27,8 @@ use File::Spec;
 use File::Temp qw(tempfile tempdir);
 use Getopt::Long qw(:config pass_through);
 use JSON;
-use POSIX qw(strftime);
 use Pod::Usage;
+use POSIX qw(strftime pathconf);
 
 ####################
 # We won't use PATH from environment
@@ -40,6 +41,7 @@ umask 0077;
 my $debug = 0;
 my $dryrun = 0;
 my $file = "";
+my $git = 0;
 my $help = 0;
 my $man = 0;
 my $since = "";
@@ -50,26 +52,35 @@ my $verbose = 0;
 #   --debug
 #   --dry-run
 #   --file=filename.json
+#   --git
 #   --verbose
 #   --since='2019-10-30 18:17:16'
 #   --until='2019-10-30 18:17:16'
 
-GetOptions("debug" => \$debug, "dry-run" => \$dryrun, "file=s" => \$file, "help|?" => \$help, "man" => \$man, "since=s" => \$since, "until=s" => \$until, "verbose" => \$verbose);
+GetOptions("debug" => \$debug, "dry-run" => \$dryrun, "file=s" => \$file, "git" => \$git, "help|?" => \$help, "man" => \$man, "since=s" => \$since, "until=s" => \$until, "verbose" => \$verbose);
 
 # Default locations of binaries
 my $newlsblk = "/usr/bin/lsblk";
 my $journalctl = "/usr/bin/journalctl";
 my $systemd_analyze = "/usr/bin/systemd-analyze";
+my $gitpath = "/usr/bin/git";
 
 if ($debug) {
 	# Allow binary path overrides
 	$newlsblk = $1 if $ENV{LSBLK_PATH} =~ /(.+)/;
 	$journalctl = $1 if $ENV{JOURNALCTL_PATH} =~ /(.+)/;
 	$systemd_analyze = $1 if $ENV{SYSTEMD_ANALYZE_PATH} =~ /(.+)/;
+	$gitpath = $1 if $ENV{GIT_PATH} =~ /(.+)/;
 
+}
+
+if ($debug || $git) {
 	# Keep temporary files
 	$File::Temp::KEEP_ALL = 1;
 }
+
+# Should we make extra entries in /sys for other data that didn't come from there?
+my $extra = ($git ? 1 : 0);
 
 pod2usage(0) if $help;
 pod2usage(-exitstatus => 0, -verbose => 2) if $man;
@@ -88,7 +99,9 @@ my %slaves;
 File::Temp->safe_level(File::Temp::HIGH);
 
 # Initialise a temporary directory
-my $basedir = tempdir("lsblk_wrap_XXXXXXXX", TMPDIR => 1, CLEANUP => 1);
+my $tempname = ($git ? "udev_git" : "lsblk_wrap");
+my $basedir = tempdir($tempname."_XXXXXXXX", TMPDIR => 1, CLEANUP => 1);
+my $path_max = POSIX::pathconf($basedir, &POSIX::_PC_PATH_MAX) - 1;
 
 print "Using temporary directory: $basedir\n" if $verbose;
 
@@ -98,6 +111,8 @@ print "Using temporary directory: $basedir\n" if $verbose;
 sub create_path(@)
 {
 	foreach my $path (@_) {
+		# Reserve 128 characters for filename inside directory
+		die "Directory name exceeds limit of " . (${path_max} - 128) . " characters: $path" if (length $path > $path_max - 128);
 		next if -d $path;
 		print "  Creating directory $path\n" if $verbose;
 		make_path($path) if !$dryrun;
@@ -109,10 +124,20 @@ sub create_file($$)
 	my $filename = shift;
 	my $contents = shift;
 
-	# FIXME limit filename length
+	return if !defined $contents;
+
+	# Strip quotes from some captured data - FIXME seek a way to avoid this
+	$contents = $1 if $contents =~ /'(.*)'/;
+
+	return if !length $contents;
+
+	die "Filename exceeds limit of " . ${path_max} . " characters: $filename" if (length $filename > $path_max);
 
 	print "  Creating file $filename\n" if $verbose;
 	return if $dryrun;
+
+	create_path(dirname($filename));
+
 	my ($fd, $tmpfile) = tempfile(basename($filename)."_XXXXXXXX", SUFFIX => ".tmp", DIR => $basedir);
 	rename($tmpfile, $filename) or croak "Failed to rename $tmpfile to $filename";
 	File::Temp::cmpstat($fd, $filename) or croak "$filename got changed externally";
@@ -199,20 +224,39 @@ sub convert_timestamp($)
 
 ####################
 
+my $gitdir = "";
+
+sub git_command(@)
+{
+	my @newargs = ("git");
+
+	push @newargs, "--git-dir", $gitdir, "--work-tree", $basedir if ($gitdir =~ /(.+)/);
+	push @newargs, @_;
+	
+	print "Running: ".join(" ", @newargs)."\n" if $verbose;
+	(system { $gitpath } @newargs) == 0 or croak "Failed to run $gitpath";
+};
+
+####################
+
 my $sysdir = $basedir."/sys";
 my $devdir = $basedir."/dev";
 
 create_path($devdir, $sysdir."/block", $sysdir."/dev/block");
 
 # FIXME Add mountpoints when we can record them.
-# create_path($basedir."/proc/self");
 # create_file($basedir."/proc/self/mountinfo", undef);
 
 ####################
 
-# Read journal entries:  
+if ($git) {
+	git_command("init", "-q", $basedir);
+	$gitdir = $basedir."/.git";
+}
 
 ####################
+
+# Read journal entries:  
 
 # Set up LOG as STDIN or $file or output from journalctl.
 if ($file eq "-") {
@@ -288,7 +332,10 @@ while (<LOG>) {
 		next;
 	}
 
-	print "Processing line $. (".strftime("%Y/%m/%d %T.", localtime $logentry->{_SOURCE_REALTIME_TIMESTAMP} / 1000000). ($logentry->{_SOURCE_REALTIME_TIMESTAMP} % 1000000).") - $logentry->{ACTION} $logentry->{DEVNAME}\n" if $verbose;
+	my $action = "";
+	$action = $1 if $logentry->{ACTION} =~ /([a-zA-Z]+)/;
+	
+	print "Processing line $. (".strftime("%Y/%m/%d %T.", localtime $logentry->{_SOURCE_REALTIME_TIMESTAMP} / 1000000). ($logentry->{_SOURCE_REALTIME_TIMESTAMP} % 1000000).") - $action $logentry->{DEVNAME}\n" if $verbose;
 
 	my $majmin = $logentry->{MAJOR}.":".$logentry->{MINOR};
 	if ($majmin =~ /^(\d+:\d+)$/) {
@@ -298,7 +345,7 @@ while (<LOG>) {
 		next;
 	}
 
-	my $devname;
+	my $devname = "";
 	if ($logentry->{DEVNAME} =~ /^(\/dev\/[-a-zA-Z0-9#+:=\@_][-a-zA-Z0-9#+.:=\@_]*)$/) {
 		$devname = $1;
 	} else {
@@ -315,7 +362,7 @@ while (<LOG>) {
 		next;
 	}
 
-	if ($logentry->{ACTION} eq "change" || $logentry->{ACTION} eq "add") {
+	if ($action eq "change" || $action eq "add") {
 		create_file("${basedir}${devname}",
 			"MAJOR=$logentry->{MAJOR}\n".
 			"MINOR=$logentry->{MINOR}\n".
@@ -360,21 +407,10 @@ while (<LOG>) {
 			create_file("$sysdevdir/device/model", $logentry->{UDEVLOG_LSBLK_MODEL});
 			create_file("$sysdevdir/device/state", $logentry->{UDEVLOG_LSBLK_STATE});
 
-			if (defined $logentry->{UDEVLOG_DEVICE_TYPE}) {
-				create_file("$sysdevdir/device/type", $logentry->{UDEVLOG_DEVICE_TYPE});
-			};
-
-			if (defined $logentry->{UDEVLOG_DEVICE_REV}) {
-				create_file("$sysdevdir/device/rev", $logentry->{UDEVLOG_DEVICE_REV});
-			};
-
-			if (defined $logentry->{UDEVLOG_DEVICE_VENDOR}) {
-				create_file("$sysdevdir/device/vendor", $logentry->{UDEVLOG_DEVICE_VENDOR});
-			};
-
-			if (defined $logentry->{UDEVLOG_DEVICE_SERIAL}) {
-				create_file("$sysdevdir/device/serial", $logentry->{UDEVLOG_DEVICE_SERIAL});
-			};
+			create_file("$sysdevdir/device/type", $logentry->{UDEVLOG_DEVICE_TYPE});
+			create_file("$sysdevdir/device/rev", $logentry->{UDEVLOG_DEVICE_REV});
+			create_file("$sysdevdir/device/vendor", $logentry->{UDEVLOG_DEVICE_VENDOR});
+			create_file("$sysdevdir/device/serial", $logentry->{UDEVLOG_DEVICE_SERIAL});
 		};
 
 		create_symlink($sysdir.$devpath, $sysdir."/dev/block/".$majmin);
@@ -390,10 +426,34 @@ while (<LOG>) {
 
 		# Device-mapper entries
 		if ($devname =~ /^\/dev\/dm-/) {
-			create_path($sysdevdir."/dm");
 			create_file("$sysdevdir/dm/name", $logentry->{DM_NAME});
 			create_file("$sysdevdir/dm/uuid", $logentry->{DM_UUID});
 			create_file("$sysdevdir/dm/suspended", $logentry->{DM_SUSPENDED});
+
+			if ($extra) {
+				create_file("$sysdevdir/dm/EXTRA/read_ahead", $logentry->{UDEVLOG_DM_READ_AHEAD});
+				create_file("$sysdevdir/dm/EXTRA/attr", $logentry->{UDEVLOG_DM_ATTR});
+				create_file("$sysdevdir/dm/EXTRA/tables_loaded", $logentry->{UDEVLOG_DM_TABLES_LOADED});
+				create_file("$sysdevdir/dm/EXTRA/readonly", $logentry->{UDEVLOG_DM_READONLY});
+				create_file("$sysdevdir/dm/EXTRA/open", $logentry->{UDEVLOG_DM_OPEN});
+				create_file("$sysdevdir/dm/EXTRA/segments", $logentry->{UDEVLOG_DM_SEGMENTS});
+				create_file("$sysdevdir/dm/EXTRA/events", $logentry->{UDEVLOG_DM_EVENTS});
+				create_file("$sysdevdir/dm/EXTRA/device_count", $logentry->{UDEVLOG_DM_DEVICE_COUNT});
+				create_file("$sysdevdir/dm/EXTRA/devs_used", $logentry->{UDEVLOG_DM_DEVS_USED});
+				create_file("$sysdevdir/dm/EXTRA/devnos_used", $logentry->{UDEVLOG_DM_DEVNOS_USED});
+				create_file("$sysdevdir/dm/EXTRA/blkdevs_used", $logentry->{UDEVLOG_DM_BLKDEVS_USED});
+				create_file("$sysdevdir/dm/EXTRA/device_ref_count", $logentry->{UDEVLOG_DM_DEVICE_REF_COUNT});
+				create_file("$sysdevdir/dm/EXTRA/names_using_dev", $logentry->{UDEVLOG_DM_NAMES_USING_DEV});
+				create_file("$sysdevdir/dm/EXTRA/devnos_using_dev", $logentry->{UDEVLOG_DM_DEVNOS_USING_DEV});
+				create_file("$sysdevdir/dm/EXTRA/subsystem", $logentry->{UDEVLOG_DM_SUBSYSTEM});
+				create_file("$sysdevdir/dm/EXTRA/lv_layer", $logentry->{UDEVLOG_LV_LAYER});
+				create_file("$sysdevdir/dm/EXTRA/table_live", $logentry->{UDEVLOG_DM_TABLE_LIVE});
+				create_file("$sysdevdir/dm/EXTRA/table_inactive", $logentry->{UDEVLOG_DM_TABLE_INACTIVE});
+				create_file("$sysdevdir/dm/EXTRA/vg_name", $logentry->{DM_VG_NAME});
+				create_file("$sysdevdir/dm/EXTRA/lv_name", $logentry->{DM_LV_NAME});
+				create_file("$sysdevdir/dm/EXTRA/lv_layer", $logentry->{DM_LV_LAYER});
+				create_file("$sysdevdir/dm/EXTRA/low_priority_flag", $logentry->{DM_UDEV_LOW_PRIORITY_FLAG});
+			};
 		};
 
 		if ($logentry->{DEVTYPE} eq "disk") {
@@ -410,21 +470,38 @@ while (<LOG>) {
 			create_file("$sysdevdir/queue/discard_granularity", $logentry->{UDEVLOG_QUEUE_DISCARD_GRANULARITY});
 		}
 
-		if (defined $logentry->{UDEVLOG_QUEUE_ADD_RANDOM}) {
-			create_file("$sysdevdir/queue/add_random", $logentry->{UDEVLOG_QUEUE_ADD_RANDOM});
-		};
+		create_file("$sysdevdir/queue/add_random", $logentry->{UDEVLOG_QUEUE_ADD_RANDOM});
+		create_file("$sysdevdir/queue/write_same_max_bytes", $logentry->{UDEVLOG_QUEUE_WRITE_SAME_MAX_BYTES});
+		create_file("$sysdevdir/queue/zoned", $logentry->{UDEVLOG_QUEUE_ZONED});
+		create_file("$sysdevdir/md/level", $logentry->{MD_LEVEL});
 
-		if (defined $logentry->{UDEVLOG_QUEUE_WRITE_SAME_MAX_BYTES}) {
-			create_file("$sysdevdir/queue/write_same_max_bytes", $logentry->{UDEVLOG_QUEUE_WRITE_SAME_MAX_BYTES});
-		};
+		# Various extra fields with nowhere else to go
+		if ($extra) {
+			create_file("$sysdevdir/EXTRA/label", $logentry->{UDEVLOG_LSBLK_LABEL});
+			create_file("$sysdevdir/EXTRA/mountpoint", $logentry->{UDEVLOG_LSBLK_MOUNTPOINT});
 
-		if (defined $logentry->{UDEVLOG_QUEUE_ZONED}) {
-			create_file("$sysdevdir/queue/zoned", $logentry->{UDEVLOG_QUEUE_ZONED});
-		};
+			create_file("$sysdevdir/EXTRA/nvme/firmware_rev", $logentry->{UDEVLOG_NVME_FIRMWARE_REV});
+			create_file("$sysdevdir/EXTRA/nvme/model", $logentry->{UDEVLOG_NVME_MODEL});
+			create_file("$sysdevdir/EXTRA/nvme/state", $logentry->{UDEVLOG_NVME_STATE});
 
-		if (defined $logentry->{MD_LEVEL}) {
-			create_path($sysdevdir."/md");
-			create_file("$sysdevdir/md/level", $logentry->{MD_LEVEL});
+			create_file("$sysdevdir/EXTRA/fc_host/port_id", $logentry->{UDEVLOG_FC_PORT_ID});
+			create_file("$sysdevdir/EXTRA/fc_host/port_name", $logentry->{UDEVLOG_FC_PORT_NAME});
+			create_file("$sysdevdir/EXTRA/fc_host/port_state", $logentry->{UDEVLOG_FC_PORT_STATE});
+			create_file("$sysdevdir/EXTRA/fc_host/fabric_name", $logentry->{UDEVLOG_FC_FABRIC_NAME});
+			create_file("$sysdevdir/EXTRA/fc_host/node_name", $logentry->{UDEVLOG_FC_NODE_NAME});
+			create_file("$sysdevdir/EXTRA/fc_host/speed", $logentry->{UDEVLOG_FC_SPEED});
+			create_file("$sysdevdir/EXTRA/fc_host/port_type", $logentry->{UDEVLOG_FC_PORT_TYPE});
+			create_file("$sysdevdir/EXTRA/fc_host/symbolic_name", $logentry->{UDEVLOG_FC_SYMBOLIC_NAME});
+			create_file("$sysdevdir/EXTRA/fc_host/tgtid_bind_type", $logentry->{UDEVLOG_FC_TGTID_BIND_TYPE});
+
+			create_file("$sysdevdir/EXTRA/scsi_host/driver_version", $logentry->{UDEVLOG_SCSI_DRIVER_VERSION});
+			create_file("$sysdevdir/EXTRA/scsi_host/fw_state", $logentry->{UDEVLOG_SCSI_FW_STATE});
+			create_file("$sysdevdir/EXTRA/scsi_host/fw_version", $logentry->{UDEVLOG_SCSI_FW_VERSION});
+			create_file("$sysdevdir/EXTRA/scsi_host/model_desc", $logentry->{UDEVLOG_SCSI_MODEL_DESC});
+			create_file("$sysdevdir/EXTRA/scsi_host/model_name", $logentry->{UDEVLOG_SCSI_MODEL_NAME});
+			create_file("$sysdevdir/EXTRA/scsi_host/serial_num", $logentry->{UDEVLOG_SCSI_SERIAL_NUM});
+			create_file("$sysdevdir/EXTRA/scsi_host/state", $logentry->{UDEVLOG_SCSI_STATE});
+			create_file("$sysdevdir/EXTRA/scsi_host/active_mode", $logentry->{UDEVLOG_SCSI_ACTIVE_MODE});
 		};
 
 		# Store holders and slaves for the end
@@ -432,7 +509,7 @@ while (<LOG>) {
 		$holders{$majmin} = $logentry->{UDEVLOG_BLOCK_HOLDERS};
 		$slaves{$majmin} = $logentry->{UDEVLOG_BLOCK_SLAVES};
 
-	} elsif ($logentry->{ACTION} eq "remove") {
+	} elsif ($action eq "remove") {
 		# Remove this item.  What about dependencies - can we trust the ordering?
 		remove_file "${basedir}${devname}";
 
@@ -458,9 +535,30 @@ while (<LOG>) {
 		delete $holders{$majmin};
 		delete $slaves{$majmin};
 	};
+
+	next if !$git;
+
+	# FIXME In git mode also fix up holders/slaves after appropriate events (some must be paired up)
+
+	# Add/remove all changed files
+	git_command("add", "-A");
+
+	# Create a git commit.
+	# FIXME Eliminate empty commits.
+	my $datestr = $1 if (strftime("%Y/%m/%d %H:%M:%S.", localtime $logentry->{_SOURCE_REALTIME_TIMESTAMP} / 1000000).($logentry->{_SOURCE_REALTIME_TIMESTAMP} % 1000001)) =~ /(.+)/;
+	my $commit_msg = "${action} ${devname} ($.)\n\n${datestr}";
+	git_command("commit", "-q", "-m", "$commit_msg", "--allow-empty");
+
+	my $tag = $1 if (strftime("d_%Y%m%d_%H%M%S.", localtime $logentry->{_SOURCE_REALTIME_TIMESTAMP} / 1000000).($logentry->{_SOURCE_REALTIME_TIMESTAMP} % 1000001)) =~ /(.+)/;
+	git_command("tag", $tag);
 }
 
 close LOG;
+
+####################
+# Nothing more to do in git mode
+print "Git repository created in $basedir\n" if $git;
+exit 0 if $git;
 
 ####################
 print "Processing all device holders\n" if $verbose;
@@ -510,6 +608,124 @@ if (!$dryrun) {
 
 exit 0;
 
+# FIXME Check this list of remaining variables found in example udev
+# database exports for any more that are worth extracting into files.
+#
+# ABS
+# BUSNUM
+# DEVNUM
+# DM_ACTIVATION
+# DM_MULTIPATH_DEVICE_PATH
+# DM_MULTIPATH_TIMESTAMP
+# DM_MULTIPATH_WIPE_PARTS
+# DM_SUBSYSTEM_UDEV_FLAG0
+# DM_UDEV_DISABLE_DISK_RULES_FLAG
+# DM_UDEV_DISABLE_LIBRARY_FALLBACK_FLAG
+# DM_UDEV_DISABLE_OTHER_RULES_FLAG
+# DM_UDEV_DISABLE_SUBSYSTEM_RULES_FLAG
+# DM_UDEV_PRIMARY_SOURCE_FLAG
+# DM_UDEV_RULES_VSN
+# DRIVER
+# EV
+# FWUPD_GUID
+# HID_ID
+# HID_NAME
+# HID_PHYS
+# HID_UNIQ
+# ID_ATA
+# ID_ATA_FEATURE_SET_PM
+# ID_ATA_FEATURE_SET_PM_ENABLED
+# ID_ATA_SATA
+# ID_ATA_SATA_SIGNAL_RATE_GEN1
+# ID_BUS
+# ID_CDROM
+# ID_CDROM_CD
+# ID_CDROM_CD_R
+# ID_CDROM_CD_RW
+# ID_CDROM_DVD
+# ID_CDROM_DVD_PLUS_R
+# ID_CDROM_DVD_PLUS_R_DL
+# ID_CDROM_DVD_PLUS_RW
+# ID_CDROM_DVD_R
+# ID_CDROM_DVD_RAM
+# ID_CDROM_DVD_RW
+# ID_CDROM_MRW
+# ID_CDROM_MRW_W
+# ID_FOR_SEAT
+# ID_FS_USAGE
+# ID_FS_UUID
+# ID_FS_VERSION
+# ID_INPUT
+# ID_INPUT_KEY
+# ID_INPUT_KEYBOARD
+# ID_INPUT_MOUSE
+# ID_MM_CANDIDATE
+# ID_MODEL_ENC
+# ID_MODEL_FROM_DATABASE
+# ID_MODEL_ID
+# ID_NET_DRIVER
+# ID_NET_LABEL_ONBOARD
+# ID_NET_LINK_FILE
+# ID_NET_NAME
+# ID_NET_NAME_MAC
+# ID_NET_NAME_ONBOARD
+# ID_NET_NAME_PATH
+# ID_OUI_FROM_DATABASE
+# ID_PART_ENTRY_DISK
+# ID_PART_ENTRY_NUMBER
+# ID_PART_ENTRY_OFFSET
+# ID_PART_ENTRY_SCHEME
+# ID_PART_ENTRY_SIZE
+# ID_PATH
+# ID_PATH_TAG
+# ID_PCI_CLASS_FROM_DATABASE
+# ID_PCI_INTERFACE_FROM_DATABASE
+# ID_PCI_SUBCLASS_FROM_DATABASE
+# ID_REVISION
+# ID_SCSI
+# ID_SERIAL
+# ID_TARGET_PORT
+# ID_TYPE
+# ID_USB_CLASS_FROM_DATABASE
+# ID_USB_DRIVER
+# ID_USB_INTERFACE_NUM
+# ID_USB_INTERFACES
+# ID_USB_PROTOCOL_FROM_DATABASE
+# ID_VENDOR
+# ID_VENDOR_ENC
+# ID_VENDOR_FROM_DATABASE
+# ID_VENDOR_ID
+# ID_WWN_VENDOR_EXTENSION
+# IFINDEX
+# INTERFACE
+# KEY
+# LED
+# LIBINPUT_DEVICE_GROUP
+# MODALIAS
+# MPATH_SBIN_PATH
+# MSC
+# NAME
+# PARTN
+# PCI_CLASS
+# PCI_ID
+# PCI_SLOT_NAME
+# PCI_SUBSYS_ID
+# PHYS
+# PRODUCT
+# PROP
+# REL
+# SND
+# SYSTEMD_ALIAS
+# SYSTEMD_MOUNT_DEVICE_BOUND
+# SYSTEMD_READY
+# SYSTEMD_WANTS
+# TAGS
+# TYPE
+# UDEV_BIOSDEVNAME
+# UNIQ
+# USEC_INITIALIZED
+# WMI_GUID
+ 
 __END__
 
 =head1 NAME
@@ -541,6 +757,13 @@ Useful with --verbose to check the effect of your input data.
 
 Read pre-filtered input from the named file instead of invoking journalctl 
 directly.  Use - to read from STDIN.
+
+=item B<--git>
+
+Create a git repository instead of running lsblk.  Device information is
+stored in files in sub-directories modelled on /dev and /sys.  Each log
+record is translated into a commit and tagged with a timestamp to make
+it easier to examine the changes over time. 
 
 =item B<--help>
 
