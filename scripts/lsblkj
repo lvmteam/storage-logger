@@ -226,6 +226,7 @@ sub convert_timestamp($)
 
 my $gitdir = "";
 
+# FIXME Deal with --dryrun!
 sub git_command(@)
 {
 	my @newargs = ("git");
